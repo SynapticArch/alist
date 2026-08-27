@@ -2,33 +2,51 @@ package _115
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/http_range"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 
+	cipher "github.com/SheltonZhu/115driver/pkg/crypto/ec115"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
-	crypto "github.com/gaoyb7/115drive-webdav/115"
-	"github.com/orzogc/fake115uploader/cipher"
 	"github.com/pkg/errors"
 )
 
-//var UserAgent = driver115.UA115Browser
+type fileInfoWithThumb struct {
+	driver115.FileInfo
+	ThumbURL string `json:"u"`
+}
 
+type fileListRespWithThumb struct {
+	driver115.BasicResp
+	CategoryID driver115.IntString `json:"cid"`
+	Count      int                 `json:"count"`
+	Offset     int                 `json:"offset"`
+	Files      []fileInfoWithThumb `json:"data"`
+}
+
+type getFileInfoResponseWithThumb struct {
+	driver115.BasicResp
+	Files []*fileInfoWithThumb `json:"data"`
+}
+
+// var UserAgent = driver115.UA115Browser
 func (d *Pan115) login() error {
 	var err error
 	opts := []driver115.Option{
@@ -46,7 +64,7 @@ func (d *Pan115) login() error {
 		if cr, err = d.client.QRCodeLoginWithApp(s, driver115.LoginApp(d.QRCodeSource)); err != nil {
 			return errors.Wrap(err, "failed to login by qrcode")
 		}
-		d.Cookie = fmt.Sprintf("UID=%s;CID=%s;SEID=%s", cr.UID, cr.CID, cr.SEID)
+		d.Cookie = fmt.Sprintf("UID=%s;CID=%s;SEID=%s;KID=%s", cr.UID, cr.CID, cr.SEID, cr.KID)
 		d.QRCodeToken = ""
 	} else if d.Cookie != "" {
 		if err = cr.FromCookie(d.Cookie); err != nil {
@@ -64,73 +82,113 @@ func (d *Pan115) getFiles(fileId string) ([]FileObj, error) {
 	if d.PageSize <= 0 {
 		d.PageSize = driver115.FileListLimit
 	}
-	files, err := d.client.ListWithLimit(fileId, d.PageSize)
+	limit := d.PageSize
+	if limit > driver115.MaxDirPageLimit {
+		limit = driver115.MaxDirPageLimit
+	}
+
+	opts := driver115.DefaultListOptions()
+	driver115.WithMultiUrls()(opts)
+	if len(opts.ApiURLs) == 0 {
+		opts.ApiURLs = []string{driver115.ApiFileList}
+	}
+
+	offset := int64(0)
+	for i := 0; ; i++ {
+		result, err := d.getFilesPageWithThumb(fileId, opts.ApiURLs[i%len(opts.ApiURLs)], limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		for _, fileInfo := range result.Files {
+			res = append(res, fileObjFromInfo(&fileInfo))
+		}
+		offset = int64(result.Offset) + limit
+		if offset >= int64(result.Count) {
+			break
+		}
+	}
+
+	return res, nil
+}
+
+func (d *Pan115) getNewFile(fileId string) (*FileObj, error) {
+	fileInfo, err := d.getFileInfoWithThumb("file_id", fileId)
 	if err != nil {
 		return nil, err
 	}
-	for _, file := range *files {
-		res = append(res, FileObj{file})
+	file := fileObjFromInfo(fileInfo)
+	return &file, nil
+}
+
+func (d *Pan115) getNewFileByPickCode(pickCode string) (*FileObj, error) {
+	fileInfo, err := d.getFileInfoWithThumb("pick_code", pickCode)
+	if err != nil {
+		return nil, err
 	}
-	return res, nil
+	file := fileObjFromInfo(fileInfo)
+	return &file, nil
 }
 
 func (d *Pan115) getUA() string {
 	return fmt.Sprintf("Mozilla/5.0 115Browser/%s", appVer)
 }
 
-func (d *Pan115) DownloadWithUA(pickCode, ua string) (*driver115.DownloadInfo, error) {
-	key := crypto.GenerateKey()
-	result := driver115.DownloadResp{}
-	params, err := utils.Json.Marshal(map[string]string{"pickcode": pickCode})
-	if err != nil {
+func fileObjFromInfo(fileInfo *fileInfoWithThumb) FileObj {
+	file := &driver115.File{}
+	file.From(&fileInfo.FileInfo)
+	return FileObj{
+		File:     *file,
+		ThumbURL: fileInfo.ThumbURL,
+	}
+}
+
+func (d *Pan115) getFileInfoWithThumb(queryKey, queryVal string) (*fileInfoWithThumb, error) {
+	result := getFileInfoResponseWithThumb{}
+	req := d.client.NewRequest().
+		SetQueryParam(queryKey, queryVal).
+		ForceContentType("application/json;charset=UTF-8").
+		SetResult(&result)
+	resp, err := req.Get(driver115.ApiFileInfo)
+	if err := driver115.CheckErr(err, &result, resp); err != nil {
 		return nil, err
 	}
+	if len(result.Files) == 0 {
+		return nil, errors.New("not get file info")
+	}
+	return result.Files[0], nil
+}
 
-	data := crypto.Encode(params, key)
-
-	bodyReader := strings.NewReader(url.Values{"data": []string{data}}.Encode())
-	reqUrl := fmt.Sprintf("%s?t=%s", driver115.ApiDownloadGetUrl, driver115.Now().String())
-	req, _ := http.NewRequest(http.MethodPost, reqUrl, bodyReader)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Cookie", d.Cookie)
-	req.Header.Set("User-Agent", ua)
-
-	resp, err := d.client.Client.GetClient().Do(req)
-	if err != nil {
+func (d *Pan115) getFilesPageWithThumb(dirID, apiURL string, limit, offset int64) (*fileListRespWithThumb, error) {
+	if dirID == "" {
+		dirID = "0"
+	}
+	result := fileListRespWithThumb{}
+	params := map[string]string{
+		"aid":              "1",
+		"cid":              dirID,
+		"o":                driver115.FileOrderByTime,
+		"asc":              "1",
+		"offset":           strconv.FormatInt(offset, 10),
+		"show_dir":         "1",
+		"limit":            strconv.FormatInt(limit, 10),
+		"snap":             "0",
+		"natsort":          "0",
+		"record_open_time": "1",
+		"format":           "json",
+		"fc_mix":           "0",
+	}
+	req := d.client.NewRequest().
+		ForceContentType("application/json;charset=UTF-8").
+		SetQueryParams(params).
+		SetResult(&result)
+	resp, err := req.Get(apiURL)
+	if err := driver115.CheckErr(err, &result, resp); err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if dirID != string(result.CategoryID) {
+		return nil, driver115.ErrUnexpected
 	}
-	if err := utils.Json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-
-	if err = result.Err(string(body)); err != nil {
-		return nil, err
-	}
-
-	bytes, err := crypto.Decode(string(result.EncodedData), key)
-	if err != nil {
-		return nil, err
-	}
-
-	downloadInfo := driver115.DownloadData{}
-	if err := utils.Json.Unmarshal(bytes, &downloadInfo); err != nil {
-		return nil, err
-	}
-
-	for _, info := range downloadInfo {
-		if info.FileSize < 0 {
-			return nil, driver115.ErrDownloadEmpty
-		}
-		info.Header = resp.Request.Header
-		return info, nil
-	}
-	return nil, driver115.ErrUnexpected
+	return &result, nil
 }
 
 func (c *Pan115) GenerateToken(fileID, preID, timeStamp, fileSize, signKey, signVal string) string {
@@ -244,8 +302,43 @@ func UploadDigestRange(stream model.FileStreamer, rangeSpec string) (result stri
 	return
 }
 
+// UploadByOSS use aliyun sdk to upload
+func (c *Pan115) UploadByOSS(ctx context.Context, params *driver115.UploadOSSParams, s model.FileStreamer, dirID string, up driver.UpdateProgress) (*UploadResult, error) {
+	ossToken, err := c.client.GetOSSToken()
+	if err != nil {
+		return nil, err
+	}
+	ossClient, err := oss.New(driver115.OSSEndpoint, ossToken.AccessKeyID, ossToken.AccessKeySecret)
+	if err != nil {
+		return nil, err
+	}
+	bucket, err := ossClient.Bucket(params.Bucket)
+	if err != nil {
+		return nil, err
+	}
+
+	var bodyBytes []byte
+	r := driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{
+		Reader:         s,
+		UpdateProgress: up,
+	})
+	if err = bucket.PutObject(params.Object, r, append(
+		driver115.OssOption(params, ossToken),
+		oss.CallbackResult(&bodyBytes),
+	)...); err != nil {
+		return nil, err
+	}
+
+	var uploadResult UploadResult
+	if err = json.Unmarshal(bodyBytes, &uploadResult); err != nil {
+		return nil, err
+	}
+	return &uploadResult, uploadResult.Err(string(bodyBytes))
+}
+
 // UploadByMultipart upload by mutipart blocks
-func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize int64, stream model.FileStreamer, dirID string, opts ...driver115.UploadMultipartOption) error {
+func (d *Pan115) UploadByMultipart(ctx context.Context, params *driver115.UploadOSSParams, fileSize int64, s model.FileStreamer,
+	dirID string, up driver.UpdateProgress, opts ...driver115.UploadMultipartOption) (*UploadResult, error) {
 	var (
 		chunks    []oss.FileChunk
 		parts     []oss.UploadPart
@@ -257,9 +350,9 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 		err       error
 	)
 
-	tmpF, err := stream.CacheFullInTempFile()
+	tmpF, err := s.CacheFullInTempFile()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	options := driver115.DefalutUploadMultipartOptions()
@@ -272,15 +365,15 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 	options.ThreadsNum = 1
 
 	if ossToken, err = d.client.GetOSSToken(); err != nil {
-		return err
+		return nil, err
 	}
 
 	if ossClient, err = oss.New(driver115.OSSEndpoint, ossToken.AccessKeyID, ossToken.AccessKeySecret, oss.EnableMD5(true), oss.EnableCRC(true)); err != nil {
-		return err
+		return nil, err
 	}
 
 	if bucket, err = ossClient.Bucket(params.Bucket); err != nil {
-		return err
+		return nil, err
 	}
 
 	// ossToken一小时后就会失效，所以每50分钟重新获取一次
@@ -290,7 +383,7 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 	timeout := time.NewTimer(options.Timeout)
 
 	if chunks, err = SplitFile(fileSize); err != nil {
-		return err
+		return nil, err
 	}
 
 	if imur, err = bucket.InitiateMultipartUpload(params.Object,
@@ -298,7 +391,7 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 		oss.UserAgentHeader(driver115.OSSUserAgent),
 		oss.EnableSha1(), oss.Sequential(),
 	); err != nil {
-		return err
+		return nil, err
 	}
 
 	wg := sync.WaitGroup{}
@@ -316,6 +409,7 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 		quit <- struct{}{}
 	}()
 
+	completedNum := atomic.Int32{}
 	// consumers
 	for i := 0; i < options.ThreadsNum; i++ {
 		go func(threadId int) {
@@ -328,24 +422,28 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 				var part oss.UploadPart // 出现错误就继续尝试，共尝试3次
 				for retry := 0; retry < 3; retry++ {
 					select {
+					case <-ctx.Done():
+						break
 					case <-ticker.C:
 						if ossToken, err = d.client.GetOSSToken(); err != nil { // 到时重新获取ossToken
 							errCh <- errors.Wrap(err, "刷新token时出现错误")
 						}
 					default:
 					}
-
 					buf := make([]byte, chunk.Size)
 					if _, err = tmpF.ReadAt(buf, chunk.Offset); err != nil && !errors.Is(err, io.EOF) {
 						continue
 					}
-
-					if part, err = bucket.UploadPart(imur, bytes.NewBuffer(buf), chunk.Size, chunk.Number, driver115.OssOption(params, ossToken)...); err == nil {
+					if part, err = bucket.UploadPart(imur, driver.NewLimitedUploadStream(ctx, bytes.NewReader(buf)),
+						chunk.Size, chunk.Number, driver115.OssOption(params, ossToken)...); err == nil {
 						break
 					}
 				}
 				if err != nil {
-					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", stream.GetName(), chunk.Number, err))
+					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", s.GetName(), chunk.Number, err))
+				} else {
+					num := completedNum.Add(1)
+					up(float64(num) * 100.0 / float64(len(chunks)))
 				}
 				UploadedPartsCh <- part
 			}
@@ -364,14 +462,14 @@ LOOP:
 		case <-ticker.C:
 			// 到时重新获取ossToken
 			if ossToken, err = d.client.GetOSSToken(); err != nil {
-				return err
+				return nil, err
 			}
 		case <-quit:
 			break LOOP
 		case <-errCh:
-			return err
+			return nil, err
 		case <-timeout.C:
-			return fmt.Errorf("time out")
+			return nil, fmt.Errorf("time out")
 		}
 	}
 
@@ -381,14 +479,14 @@ LOOP:
 		driver115.OssOption(params, ossToken),
 		oss.CallbackResult(&bodyBytes),
 	)...); err != nil {
-		return err
+		return nil, err
 	}
 
 	var uploadResult UploadResult
 	if err = json.Unmarshal(bodyBytes, &uploadResult); err != nil {
-		return err
+		return nil, err
 	}
-	return uploadResult.Err(string(bodyBytes))
+	return &uploadResult, uploadResult.Err(string(bodyBytes))
 }
 
 func chunksProducer(ch chan oss.FileChunk, chunks []oss.FileChunk) {

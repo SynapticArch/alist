@@ -117,6 +117,11 @@ func getMainItems(config driver.Config) []driver.Item {
 		Name: "down_proxy_url",
 		Type: conf.TypeText,
 	})
+	items = append(items, driver.Item{
+		Name:    "down_proxy_sign",
+		Type:    conf.TypeBool,
+		Default: "true",
+	})
 	if config.LocalSort {
 		items = append(items, []driver.Item{{
 			Name:    "order_by",
@@ -132,6 +137,12 @@ func getMainItems(config driver.Config) []driver.Item {
 		Name:    "extract_folder",
 		Type:    conf.TypeSelect,
 		Options: "front,back",
+	})
+	items = append(items, driver.Item{
+		Name:     "disable_index",
+		Type:     conf.TypeBool,
+		Default:  "false",
+		Required: true,
 	})
 	items = append(items, driver.Item{
 		Name:     "enable_sign",

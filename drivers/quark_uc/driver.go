@@ -1,18 +1,22 @@
 package quark
 
 import (
+	"bytes"
 	"context"
-	"crypto/md5"
-	"crypto/sha1"
 	"encoding/hex"
+	"hash"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
+	streamPkg "github.com/alist-org/alist/v3/internal/stream"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
@@ -23,6 +27,15 @@ type QuarkOrUC struct {
 	Addition
 	config driver.Config
 	conf   Conf
+
+	// client 用于测试时注入自定义 client，nil 时使用全局 base.RestyClient
+	client *resty.Client
+
+	// cookieMu 保护 d.Cookie 的读-改-写，避免多 goroutine（定时刷新 + 并发业务请求）竞态
+	cookieMu sync.Mutex
+
+	refreshMu sync.Mutex
+	cancel    context.CancelFunc
 }
 
 func (d *QuarkOrUC) Config() driver.Config {
@@ -35,47 +48,56 @@ func (d *QuarkOrUC) GetAddition() driver.Additional {
 
 func (d *QuarkOrUC) Init(ctx context.Context) error {
 	_, err := d.request("/config", http.MethodGet, nil, nil)
+	if err == nil && d.AdditionVersion != 3 {
+		if d.AdditionVersion < 2 {
+			if !d.UseTransCodingAddress && len(d.DownProxyUrl) == 0 {
+				d.WebProxy = true
+				d.WebdavPolicy = "native_proxy"
+			}
+		}
+		// 老存储没有这两个字段，补成原来的固定值，保持行为不变
+		if d.DownConcurrency <= 0 {
+			d.DownConcurrency = 3
+		}
+		if d.DownPartSize <= 0 {
+			d.DownPartSize = 10
+		}
+		d.AdditionVersion = 3
+		op.MustSaveDriverStorage(d)
+	}
+	// 定时刷新 __puus，避免会话 cookie 过期后下载 403（见 AlistGo/alist#830）
+	d.startRefreshLoop()
 	return err
 }
 
 func (d *QuarkOrUC) Drop(ctx context.Context) error {
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+	if d.cancel != nil {
+		d.cancel()
+		d.cancel = nil
+	}
 	return nil
 }
 
 func (d *QuarkOrUC) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	files, err := d.GetFiles(dir.GetID())
-	if err != nil {
-		return nil, err
-	}
-	return utils.SliceConvert(files, func(src File) (model.Obj, error) {
-		return fileToObj(src), nil
-	})
+	return d.GetFiles(dir.GetID())
 }
 
 func (d *QuarkOrUC) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	data := base.Json{
-		"fids": []string{file.GetID()},
-	}
-	var resp DownResp
-	ua := d.conf.ua
-	_, err := d.request("/file/download", http.MethodPost, func(req *resty.Request) {
-		req.SetHeader("User-Agent", ua).
-			SetBody(data)
-	}, &resp)
-	if err != nil {
+	f := file.(*File)
+	if d.UseTransCodingAddress && d.config.Name == "Quark" && f.Category == 1 && f.Size > 0 {
+		link, err := d.getTranscodingLink(file)
+		if err == nil {
+			return link, nil
+		}
+		if strings.Contains(err.Error(), "plf_invalid") {
+			log.Warnf("quark transcoding link invalid for %s, fallback to download link: %v", file.GetName(), err)
+			return d.getDownloadLink(file)
+		}
 		return nil, err
 	}
-
-	return &model.Link{
-		URL: resp.Data[0].DownloadUrl,
-		Header: http.Header{
-			"Cookie":     []string{d.Cookie},
-			"Referer":    []string{d.conf.referer},
-			"User-Agent": []string{ua},
-		},
-		Concurrency: 2,
-		PartSize:    10 * utils.MB,
-	}, nil
+	return d.getDownloadLink(file)
 }
 
 func (d *QuarkOrUC) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
@@ -135,33 +157,33 @@ func (d *QuarkOrUC) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	tempFile, err := stream.CacheFullInTempFile()
-	if err != nil {
-		return err
+	md5Str, sha1Str := stream.GetHash().GetHash(utils.MD5), stream.GetHash().GetHash(utils.SHA1)
+	var (
+		md5  hash.Hash
+		sha1 hash.Hash
+	)
+	writers := []io.Writer{}
+	if len(md5Str) != utils.MD5.Width {
+		md5 = utils.MD5.NewFunc()
+		writers = append(writers, md5)
 	}
-	defer func() {
-		_ = tempFile.Close()
-	}()
-	m := md5.New()
-	_, err = utils.CopyWithBuffer(m, tempFile)
-	if err != nil {
-		return err
+	if len(sha1Str) != utils.SHA1.Width {
+		sha1 = utils.SHA1.NewFunc()
+		writers = append(writers, sha1)
 	}
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return err
+
+	if len(writers) > 0 {
+		_, err := streamPkg.CacheFullInTempFileAndWriter(stream, io.MultiWriter(writers...))
+		if err != nil {
+			return err
+		}
+		if md5 != nil {
+			md5Str = hex.EncodeToString(md5.Sum(nil))
+		}
+		if sha1 != nil {
+			sha1Str = hex.EncodeToString(sha1.Sum(nil))
+		}
 	}
-	md5Str := hex.EncodeToString(m.Sum(nil))
-	s := sha1.New()
-	_, err = utils.CopyWithBuffer(s, tempFile)
-	if err != nil {
-		return err
-	}
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return err
-	}
-	sha1Str := hex.EncodeToString(s.Sum(nil))
 	// pre
 	pre, err := d.upPre(stream, dstDir.GetID())
 	if err != nil {
@@ -177,29 +199,31 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 		return nil
 	}
 	// part up
-	partSize := pre.Metadata.PartSize
-	var bytes []byte
-	md5s := make([]string, 0)
-	defaultBytes := make([]byte, partSize)
 	total := stream.GetSize()
 	left := total
+	partSize := int64(pre.Metadata.PartSize)
+	part := make([]byte, partSize)
+	count := int(total / partSize)
+	if total%partSize > 0 {
+		count++
+	}
+	md5s := make([]string, 0, count)
 	partNumber := 1
 	for left > 0 {
 		if utils.IsCanceled(ctx) {
 			return ctx.Err()
 		}
-		if left > int64(partSize) {
-			bytes = defaultBytes
-		} else {
-			bytes = make([]byte, left)
+		if left < partSize {
+			part = part[:left]
 		}
-		_, err := io.ReadFull(tempFile, bytes)
+		n, err := io.ReadFull(stream, part)
 		if err != nil {
 			return err
 		}
-		left -= int64(len(bytes))
+		left -= int64(n)
 		log.Debugf("left: %d", left)
-		m, err := d.upPart(ctx, pre, stream.GetMimetype(), partNumber, bytes)
+		reader := driver.NewLimitedUploadStream(ctx, bytes.NewReader(part))
+		m, err := d.upPart(ctx, pre, stream.GetMimetype(), partNumber, reader)
 		//m, err := driver.UpPart(pre, file.GetMIMEType(), partNumber, bytes, account, md5Str, sha1Str)
 		if err != nil {
 			return err

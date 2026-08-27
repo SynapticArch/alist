@@ -3,8 +3,10 @@ package fs
 import (
 	"context"
 	"fmt"
+	"github.com/alist-org/alist/v3/internal/errs"
 	"net/http"
 	stdpath "path"
+	"time"
 
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -18,7 +20,7 @@ import (
 )
 
 type CopyTask struct {
-	task.TaskWithCreator
+	task.TaskExtension
 	Status       string        `json:"-"` //don't save status to save space
 	SrcObjPath   string        `json:"src_path"`
 	DstDirPath   string        `json:"dst_path"`
@@ -26,6 +28,7 @@ type CopyTask struct {
 	dstStorage   driver.Driver `json:"-"`
 	SrcStorageMp string        `json:"src_storage_mp"`
 	DstStorageMp string        `json:"dst_storage_mp"`
+	SkipExisting bool          `json:"skip_existing"`
 }
 
 func (t *CopyTask) GetName() string {
@@ -37,6 +40,10 @@ func (t *CopyTask) GetStatus() string {
 }
 
 func (t *CopyTask) Run() error {
+	t.ReinitCtx()
+	t.ClearEndTime()
+	t.SetStartTime(time.Now())
+	defer func() { t.SetEndTime(time.Now()) }()
 	var err error
 	if t.srcStorage == nil {
 		t.srcStorage, err = op.GetStorageByMountPath(t.SrcStorageMp)
@@ -54,7 +61,7 @@ var CopyTaskManager *tache.Manager[*CopyTask]
 
 // Copy if in the same storage, call move method
 // if not, add copy task
-func _copy(ctx context.Context, srcObjPath, dstDirPath string, lazyCache ...bool) (task.TaskInfoWithCreator, error) {
+func _copy(ctx context.Context, srcObjPath, dstDirPath string, lazyCache ...bool) (task.TaskExtensionInfo, error) {
 	srcStorage, srcObjActualPath, err := op.GetStorageAndActualPath(srcObjPath)
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed get src storage")
@@ -63,9 +70,22 @@ func _copy(ctx context.Context, srcObjPath, dstDirPath string, lazyCache ...bool
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed get dst storage")
 	}
+	skipExisting := ctx.Value(conf.SkipExistingKey) != nil
 	// copy if in the same storage, just call driver.Copy
 	if srcStorage.GetStorage() == dstStorage.GetStorage() {
-		return nil, op.Copy(ctx, srcStorage, srcObjActualPath, dstDirActualPath, lazyCache...)
+		if skipExisting {
+			if srcObj, err := op.Get(ctx, srcStorage, srcObjActualPath); err == nil && !srcObj.IsDir() {
+				dstFilePath := stdpath.Join(dstDirActualPath, srcObj.GetName())
+				if dstFile, err := op.Get(ctx, dstStorage, dstFilePath); err == nil &&
+					!dstFile.IsDir() && dstFile.GetSize() == srcObj.GetSize() {
+					return nil, nil
+				}
+			}
+		}
+		err = op.Copy(ctx, srcStorage, srcObjActualPath, dstDirActualPath, lazyCache...)
+		if !errors.Is(err, errs.NotImplement) && !errors.Is(err, errs.NotSupport) {
+			return nil, err
+		}
 	}
 	if ctx.Value(conf.NoTaskKey) != nil {
 		srcObj, err := op.Get(ctx, srcStorage, srcObjActualPath)
@@ -93,9 +113,9 @@ func _copy(ctx context.Context, srcObjPath, dstDirPath string, lazyCache ...bool
 		}
 	}
 	// not in the same storage
-	taskCreator, _ := ctx.Value("user").(*model.User) // taskCreator is nil when convert failed
+	taskCreator, _ := ctx.Value("user").(*model.User)
 	t := &CopyTask{
-		TaskWithCreator: task.TaskWithCreator{
+		TaskExtension: task.TaskExtension{
 			Creator: taskCreator,
 		},
 		srcStorage:   srcStorage,
@@ -104,6 +124,7 @@ func _copy(ctx context.Context, srcObjPath, dstDirPath string, lazyCache ...bool
 		DstDirPath:   dstDirActualPath,
 		SrcStorageMp: srcStorage.GetStorage().MountPath,
 		DstStorageMp: dstStorage.GetStorage().MountPath,
+		SkipExisting: skipExisting,
 	}
 	CopyTaskManager.Add(t)
 	return t, nil
@@ -128,8 +149,8 @@ func copyBetween2Storages(t *CopyTask, srcStorage, dstStorage driver.Driver, src
 			srcObjPath := stdpath.Join(srcObjPath, obj.GetName())
 			dstObjPath := stdpath.Join(dstDirPath, srcObj.GetName())
 			CopyTaskManager.Add(&CopyTask{
-				TaskWithCreator: task.TaskWithCreator{
-					Creator: t.Creator,
+				TaskExtension: task.TaskExtension{
+					Creator: t.GetCreator(),
 				},
 				srcStorage:   srcStorage,
 				dstStorage:   dstStorage,
@@ -137,6 +158,7 @@ func copyBetween2Storages(t *CopyTask, srcStorage, dstStorage driver.Driver, src
 				DstDirPath:   dstObjPath,
 				SrcStorageMp: srcStorage.GetStorage().MountPath,
 				DstStorageMp: dstStorage.GetStorage().MountPath,
+				SkipExisting: t.SkipExisting,
 			})
 		}
 		t.Status = "src object is dir, added all copy tasks of objs"
@@ -149,6 +171,17 @@ func copyFileBetween2Storages(tsk *CopyTask, srcStorage, dstStorage driver.Drive
 	srcFile, err := op.Get(tsk.Ctx(), srcStorage, srcFilePath)
 	if err != nil {
 		return errors.WithMessagef(err, "failed get src [%s] file", srcFilePath)
+	}
+	tsk.SetTotalBytes(srcFile.GetSize())
+	if tsk.SkipExisting {
+		dstFilePath := stdpath.Join(dstDirPath, srcFile.GetName())
+		// a failed probe falls through to a normal copy, worst case is a redundant transfer
+		if dstFile, err := op.Get(tsk.Ctx(), dstStorage, dstFilePath); err == nil &&
+			!dstFile.IsDir() && dstFile.GetSize() == srcFile.GetSize() {
+			tsk.Status = "skipped: destination file already exists"
+			tsk.SetProgress(100)
+			return nil
+		}
 	}
 	link, _, err := op.Link(tsk.Ctx(), srcStorage, srcFilePath, model.LinkArgs{
 		Header: http.Header{},

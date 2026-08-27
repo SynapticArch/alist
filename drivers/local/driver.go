@@ -18,6 +18,7 @@ import (
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/internal/sign"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/alist-org/alist/v3/server/common"
@@ -31,10 +32,19 @@ type Local struct {
 	model.Storage
 	Addition
 	mkdirPerm int32
+	thumbSize int
 
 	// zero means no limit
 	thumbConcurrency int
 	thumbTokenBucket TokenBucket
+
+	// video thumb position
+	videoThumbPos             float64
+	videoThumbPosIsPercentage bool
+	thumbPixel                int
+
+	// use ffmpeg
+	useFFmpeg bool
 }
 
 func (d *Local) Config() driver.Config {
@@ -61,11 +71,25 @@ func (d *Local) Init(ctx context.Context) error {
 		}
 		d.Addition.RootFolderPath = abs
 	}
+
+	d.useFFmpeg = d.UseFFmpeg
+
 	if d.ThumbCacheFolder != "" && !utils.Exists(d.ThumbCacheFolder) {
 		err := os.MkdirAll(d.ThumbCacheFolder, os.FileMode(d.mkdirPerm))
 		if err != nil {
 			return err
 		}
+	}
+	d.thumbSize = 144
+	if item, err := op.GetSettingItemByKey(conf.ThumbnailSize); err == nil && item != nil && strings.TrimSpace(item.Value) != "" {
+		v, err := strconv.ParseUint(item.Value, 10, 32)
+		if err != nil {
+			return fmt.Errorf("invalid setting %s value: %s, err: %s", conf.ThumbnailSize, item.Value, err)
+		}
+		if v == 0 {
+			return fmt.Errorf("invalid setting %s value: %s, the value must be a positive integer", conf.ThumbnailSize, item.Value)
+		}
+		d.thumbSize = int(v)
 	}
 	if d.ThumbConcurrency != "" {
 		v, err := strconv.ParseUint(d.ThumbConcurrency, 10, 32)
@@ -74,10 +98,44 @@ func (d *Local) Init(ctx context.Context) error {
 		}
 		d.thumbConcurrency = int(v)
 	}
+	if d.ThumbPixel != "" {
+		v, err := strconv.ParseUint(d.ThumbPixel, 10, 32)
+		if err != nil {
+			return err
+		}
+		d.thumbPixel = int(v)
+	}
+
 	if d.thumbConcurrency == 0 {
 		d.thumbTokenBucket = NewNopTokenBucket()
 	} else {
 		d.thumbTokenBucket = NewStaticTokenBucketWithMigration(d.thumbTokenBucket, d.thumbConcurrency)
+	}
+	// Check the VideoThumbPos value
+	if d.VideoThumbPos == "" {
+		d.VideoThumbPos = "20%"
+	}
+	if strings.HasSuffix(d.VideoThumbPos, "%") {
+		percentage := strings.TrimSuffix(d.VideoThumbPos, "%")
+		val, err := strconv.ParseFloat(percentage, 64)
+		if err != nil {
+			return fmt.Errorf("invalid video_thumb_pos value: %s, err: %s", d.VideoThumbPos, err)
+		}
+		if val < 0 || val > 100 {
+			return fmt.Errorf("invalid video_thumb_pos value: %s, the precentage must be a number between 0 and 100", d.VideoThumbPos)
+		}
+		d.videoThumbPosIsPercentage = true
+		d.videoThumbPos = val / 100
+	} else {
+		val, err := strconv.ParseFloat(d.VideoThumbPos, 64)
+		if err != nil {
+			return fmt.Errorf("invalid video_thumb_pos value: %s, err: %s", d.VideoThumbPos, err)
+		}
+		if val < 0 {
+			return fmt.Errorf("invalid video_thumb_pos value: %s, the time must be a positive number", d.VideoThumbPos)
+		}
+		d.videoThumbPosIsPercentage = false
+		d.videoThumbPos = val
 	}
 	return nil
 }
@@ -101,28 +159,29 @@ func (d *Local) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([
 		if !d.ShowHidden && strings.HasPrefix(f.Name(), ".") {
 			continue
 		}
-		file := d.FileInfoToObj(f, args.ReqPath, fullPath)
+		file := d.FileInfoToObj(ctx, f, args.ReqPath, fullPath)
 		files = append(files, file)
 	}
 	return files, nil
 }
-func (d *Local) FileInfoToObj(f fs.FileInfo, reqPath string, fullPath string) model.Obj {
+func (d *Local) FileInfoToObj(ctx context.Context, f fs.FileInfo, reqPath string, fullPath string) model.Obj {
 	thumb := ""
 	if d.Thumbnail {
 		typeName := utils.GetFileType(f.Name())
 		if typeName == conf.IMAGE || typeName == conf.VIDEO {
-			thumb = common.GetApiUrl(nil) + stdpath.Join("/d", reqPath, f.Name())
+			thumb = common.GetApiUrl(common.GetHttpReq(ctx)) + stdpath.Join("/d", reqPath, f.Name())
 			thumb = utils.EncodePath(thumb, true)
 			thumb += "?type=thumb&sign=" + sign.Sign(stdpath.Join(reqPath, f.Name()))
 		}
 	}
-	isFolder := f.IsDir() || isSymlinkDir(f, fullPath)
+	filePath := filepath.Join(fullPath, f.Name())
+	isFolder := f.IsDir() || isLinkedDir(f, filePath)
 	var size int64
 	if !isFolder {
 		size = f.Size()
 	}
 	var ctime time.Time
-	t, err := times.Stat(stdpath.Join(fullPath, f.Name()))
+	t, err := times.Stat(filePath)
 	if err == nil {
 		if t.HasBirthTime() {
 			ctime = t.BirthTime()
@@ -131,7 +190,7 @@ func (d *Local) FileInfoToObj(f fs.FileInfo, reqPath string, fullPath string) mo
 
 	file := model.ObjThumb{
 		Object: model.Object{
-			Path:     filepath.Join(fullPath, f.Name()),
+			Path:     filePath,
 			Name:     f.Name(),
 			Modified: f.ModTime(),
 			Size:     size,
@@ -149,7 +208,7 @@ func (d *Local) GetMeta(ctx context.Context, path string) (model.Obj, error) {
 	if err != nil {
 		return nil, err
 	}
-	file := d.FileInfoToObj(f, path, path)
+	file := d.FileInfoToObj(ctx, f, path, path)
 	//h := "123123"
 	//if s, ok := f.(model.SetHash); ok && file.GetHash() == ("","")  {
 	//	s.SetHash(h,"SHA1")
@@ -167,7 +226,7 @@ func (d *Local) Get(ctx context.Context, path string) (model.Obj, error) {
 		}
 		return nil, err
 	}
-	isFolder := f.IsDir() || isSymlinkDir(f, path)
+	isFolder := f.IsDir() || isLinkedDir(f, path)
 	size := f.Size()
 	if isFolder {
 		size = 0
@@ -280,7 +339,7 @@ func (d *Local) Copy(_ context.Context, srcObj, dstDir model.Obj) error {
 	return cp.Copy(srcPath, dstPath, cp.Options{
 		Sync:          true, // Sync file to disk after copy, may have performance penalty in filesystem such as ZFS
 		PreserveTimes: true,
-		NumOfWorkers:  0, // Serialized copy without using goroutine
+		PreserveOwner: true,
 	})
 }
 

@@ -11,6 +11,9 @@ const (
 	SSO
 	LDAP
 	S3
+	FTP
+	TRAFFIC
+	FRP
 )
 
 const (

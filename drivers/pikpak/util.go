@@ -7,37 +7,36 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"github.com/go-resty/resty/v2"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
-	"golang.org/x/oauth2"
-	"io"
-	"net/http"
-	"path/filepath"
-	"regexp"
-	"strings"
-	"sync"
-	"time"
-
-	"github.com/alist-org/alist/v3/drivers/base"
-	"github.com/go-resty/resty/v2"
 )
 
-// do others that not defined in Driver interface
-
 var AndroidAlgorithms = []string{
-	"aDhgaSE3MsjROCmpmsWqP1sJdFJ",
-	"+oaVkqdd8MJuKT+uMr2AYKcd9tdWge3XPEPR2hcePUknd",
-	"u/sd2GgT2fTytRcKzGicHodhvIltMntA3xKw2SRv7S48OdnaQIS5mn",
-	"2WZiae2QuqTOxBKaaqCNHCW3olu2UImelkDzBn",
-	"/vJ3upic39lgmrkX855Qx",
-	"yNc9ruCVMV7pGV7XvFeuLMOcy1",
-	"4FPq8mT3JQ1jzcVxMVfwFftLQm33M7i",
-	"xozoy5e3Ea",
+	"SOP04dGzk0TNO7t7t9ekDbAmx+eq0OI1ovEx",
+	"nVBjhYiND4hZ2NCGyV5beamIr7k6ifAsAbl",
+	"Ddjpt5B/Cit6EDq2a6cXgxY9lkEIOw4yC1GDF28KrA",
+	"VVCogcmSNIVvgV6U+AochorydiSymi68YVNGiz",
+	"u5ujk5sM62gpJOsB/1Gu/zsfgfZO",
+	"dXYIiBOAHZgzSruaQ2Nhrqc2im",
+	"z5jUTBSIpBN9g4qSJGlidNAutX6",
+	"KJE2oveZ34du/g1tiimm",
 }
 
 var WebAlgorithms = []string{
@@ -80,9 +79,9 @@ const (
 const (
 	AndroidClientID      = "YNxT9w7GMdWvEOKa"
 	AndroidClientSecret  = "dbw2OtmVEeuUvIptb1Coyg"
-	AndroidClientVersion = "1.48.3"
+	AndroidClientVersion = "1.53.2"
 	AndroidPackageName   = "com.pikcloud.pikpak"
-	AndroidSdkVersion    = "2.0.4.204101"
+	AndroidSdkVersion    = "2.0.6.206003"
 	WebClientID          = "YUMx5nI8ZU8Ap8pm"
 	WebClientSecret      = "dbw2OtmVEeuUvIptb1Coyg"
 	WebClientVersion     = "2.0.0"
@@ -90,47 +89,97 @@ const (
 	WebSdkVersion        = "8.0.3"
 	PCClientID           = "YvtoWO6GNHiuCl7x"
 	PCClientSecret       = "1NIH5R1IEe2pAxZE3hv3uA"
-	PCClientVersion      = "undefined" // 2.5.6.4831
+	PCClientVersion      = "undefined" // 2.6.11.4955
 	PCPackageName        = "mypikpak.com"
 	PCSdkVersion         = "8.0.3"
 )
 
-var DlAddr = []string{
-	"dl-a10b-0621.mypikpak.com",
-	"dl-a10b-0622.mypikpak.com",
-	"dl-a10b-0623.mypikpak.com",
-	"dl-a10b-0624.mypikpak.com",
-	"dl-a10b-0625.mypikpak.com",
-	"dl-a10b-0858.mypikpak.com",
-	"dl-a10b-0859.mypikpak.com",
-	"dl-a10b-0860.mypikpak.com",
-	"dl-a10b-0861.mypikpak.com",
-	"dl-a10b-0862.mypikpak.com",
-	"dl-a10b-0863.mypikpak.com",
-	"dl-a10b-0864.mypikpak.com",
-	"dl-a10b-0865.mypikpak.com",
-	"dl-a10b-0866.mypikpak.com",
-	"dl-a10b-0867.mypikpak.com",
-	"dl-a10b-0868.mypikpak.com",
-	"dl-a10b-0869.mypikpak.com",
-	"dl-a10b-0870.mypikpak.com",
-	"dl-a10b-0871.mypikpak.com",
-	"dl-a10b-0872.mypikpak.com",
-	"dl-a10b-0873.mypikpak.com",
-	"dl-a10b-0874.mypikpak.com",
-	"dl-a10b-0875.mypikpak.com",
-	"dl-a10b-0876.mypikpak.com",
-	"dl-a10b-0877.mypikpak.com",
-	"dl-a10b-0878.mypikpak.com",
-	"dl-a10b-0879.mypikpak.com",
-	"dl-a10b-0880.mypikpak.com",
-	"dl-a10b-0881.mypikpak.com",
-	"dl-a10b-0882.mypikpak.com",
-	"dl-a10b-0883.mypikpak.com",
-	"dl-a10b-0884.mypikpak.com",
-	"dl-a10b-0885.mypikpak.com",
-	"dl-a10b-0886.mypikpak.com",
-	"dl-a10b-0887.mypikpak.com",
+// defaultPikPakDomain is the API domain used when api_domain is left empty.
+const defaultPikPakDomain = "mypikpak.net"
+
+// pikPakDomains is the list of known PikPak domains whose host can be swapped
+// on download/play links. See issue #9559.
+var pikPakDomains = []string{"mypikpak.com", "mypikpak.net", "pikpak.me", "pikpakdrive.com"}
+
+// domainOptionMap maps the built-in select option keys (which avoid dots so the
+// web UI renders readable labels) to the real domains.
+var domainOptionMap = map[string]string{
+	"mypikpak_net":    "mypikpak.net",
+	"mypikpak_com":    "mypikpak.com",
+	"pikpak_me":       "pikpak.me",
+	"pikpakdrive_com": "pikpakdrive.com",
+}
+
+// resolveDomainOption turns a built-in option key into its real domain, while
+// passing through any value already in domain form (manual entry / legacy).
+func resolveDomainOption(v string) string {
+	if domain, ok := domainOptionMap[v]; ok {
+		return domain
+	}
+	return v
+}
+
+// getApiDomain returns the API domain to use: the manually entered
+// custom_api_domain takes precedence over the selected api_domain, and falls
+// back to the default when both are empty.
+func (d *PikPak) getApiDomain() string {
+	if domain := strings.TrimSpace(d.CustomApiDomain); domain != "" {
+		return domain
+	}
+	if domain := strings.TrimSpace(d.ApiDomain); domain != "" {
+		return resolveDomainOption(domain)
+	}
+	return defaultPikPakDomain
+}
+
+// getDownloadDomain returns the domain that download/play links should be
+// rewritten to, or "" when links should be kept unchanged. The manually
+// entered custom_download_domain takes precedence over the selected
+// download_domain; the sentinel "original" means "do not rewrite".
+func (d *PikPak) getDownloadDomain() string {
+	if domain := strings.TrimSpace(d.CustomDownloadDomain); domain != "" {
+		return domain
+	}
+	if domain := strings.TrimSpace(d.DownloadDomain); domain != "" && domain != "original" {
+		return resolveDomainOption(domain)
+	}
+	return ""
+}
+
+// apiURL builds an api-drive.<domain> URL for the given path (path starts with "/").
+func (d *PikPak) apiURL(path string) string {
+	return "https://api-drive." + d.getApiDomain() + path
+}
+
+// userURL builds a user.<domain> URL for the given path (path starts with "/").
+func (d *PikPak) userURL(path string) string {
+	return "https://user." + d.getApiDomain() + path
+}
+
+// rewriteDownloadURL rewrites the host of a download/play link to the configured
+// download_domain, keeping the original subdomain prefix (e.g. dl-a.mypikpak.com
+// -> dl-a.mypikpak.net). It is a no-op when download_domain is empty or the link
+// host is not a known PikPak domain.
+func (d *PikPak) rewriteDownloadURL(rawURL string) string {
+	domain := d.getDownloadDomain()
+	if domain == "" || rawURL == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	for _, base := range pikPakDomains {
+		if u.Host == base {
+			u.Host = domain
+			return u.String()
+		}
+		if strings.HasSuffix(u.Host, "."+base) {
+			u.Host = strings.TrimSuffix(u.Host, base) + domain
+			return u.String()
+		}
+	}
+	return rawURL
 }
 
 func (d *PikPak) login() error {
@@ -139,7 +188,7 @@ func (d *PikPak) login() error {
 		return errors.New("username or password is empty")
 	}
 
-	url := "https://user.mypikpak.com/v1/auth/signin"
+	url := d.userURL("/v1/auth/signin")
 	// 使用 用户填写的 CaptchaToken —————— (验证后的captcha_token)
 	if d.GetCaptchaToken() == "" {
 		if err := d.RefreshCaptchaTokenInLogin(GetAction(http.MethodPost, url), d.Username); err != nil {
@@ -169,7 +218,7 @@ func (d *PikPak) login() error {
 }
 
 func (d *PikPak) refreshToken(refreshToken string) error {
-	url := "https://user.mypikpak.com/v1/auth/token"
+	url := d.userURL("/v1/auth/token")
 	var e ErrResp
 	res, err := base.RestyClient.SetRetryCount(1).R().SetError(&e).
 		SetHeader("user-agent", "").SetBody(base.Json{
@@ -207,30 +256,6 @@ func (d *PikPak) refreshToken(refreshToken string) error {
 	return nil
 }
 
-func (d *PikPak) initializeOAuth2Token(ctx context.Context, oauth2Config *oauth2.Config, refreshToken string) {
-	d.oauth2Token = oauth2.ReuseTokenSource(nil, utils.TokenSource(func() (*oauth2.Token, error) {
-		return oauth2Config.TokenSource(ctx, &oauth2.Token{
-			RefreshToken: refreshToken,
-		}).Token()
-	}))
-}
-
-func (d *PikPak) refreshTokenByOAuth2() error {
-	token, err := d.oauth2Token.Token()
-	if err != nil {
-		return err
-	}
-	d.Status = "work"
-	d.RefreshToken = token.RefreshToken
-	d.AccessToken = token.AccessToken
-	// 获取用户ID
-	userID := token.Extra("sub").(string)
-	d.Common.SetUserID(userID)
-	d.Addition.RefreshToken = d.RefreshToken
-	op.MustSaveDriverStorage(d)
-	return nil
-}
-
 func (d *PikPak) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
 	req := base.RestyClient.R()
 	req.SetHeaders(map[string]string{
@@ -239,14 +264,7 @@ func (d *PikPak) request(url string, method string, callback base.ReqCallback, r
 		"X-Device-ID":     d.GetDeviceID(),
 		"X-Captcha-Token": d.GetCaptchaToken(),
 	})
-	if d.RefreshTokenMethod == "oauth2" && d.oauth2Token != nil {
-		// 使用oauth2 获取 access_token
-		token, err := d.oauth2Token.Token()
-		if err != nil {
-			return nil, err
-		}
-		req.SetAuthScheme(token.TokenType).SetAuthToken(token.AccessToken)
-	} else if d.AccessToken != "" {
+	if d.AccessToken != "" {
 		req.SetHeader("Authorization", "Bearer "+d.AccessToken)
 	}
 
@@ -268,16 +286,9 @@ func (d *PikPak) request(url string, method string, callback base.ReqCallback, r
 		return res.Body(), nil
 	case 4122, 4121, 16:
 		// access_token 过期
-		if d.RefreshTokenMethod == "oauth2" {
-			if err1 := d.refreshTokenByOAuth2(); err1 != nil {
-				return nil, err1
-			}
-		} else {
-			if err1 := d.refreshToken(d.RefreshToken); err1 != nil {
-				return nil, err1
-			}
+		if err1 := d.refreshToken(d.RefreshToken); err1 != nil {
+			return nil, err1
 		}
-
 		return d.request(url, method, callback, resp)
 	case 9: // 验证码token过期
 		if err = d.RefreshCaptchaTokenAtLogin(GetAction(method, url), d.GetUserID()); err != nil {
@@ -307,7 +318,7 @@ func (d *PikPak) getFiles(id string) ([]File, error) {
 			"page_token":     pageToken,
 		}
 		var resp Files
-		_, err := d.request("https://api-drive.mypikpak.com/drive/v1/files", http.MethodGet, func(req *resty.Request) {
+		_, err := d.request(d.apiURL("/drive/v1/files"), http.MethodGet, func(req *resty.Request) {
 			req.SetQueryParams(query)
 		}, &resp)
 		if err != nil {
@@ -338,7 +349,6 @@ type Common struct {
 	UserAgent     string
 	// 验证码token刷新成功回调
 	RefreshCTokenCk func(token string)
-	LowLatencyAddr  string
 }
 
 func generateDeviceSign(deviceID, packageName string) string {
@@ -473,7 +483,7 @@ func (d *PikPak) refreshCaptchaToken(action string, metas map[string]string) err
 	}
 	var e ErrResp
 	var resp CaptchaTokenResponse
-	_, err := d.request("https://user.mypikpak.com/v1/shield/captcha/init", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(d.userURL("/v1/shield/captcha/init"), http.MethodPost, func(req *resty.Request) {
 		req.SetError(&e).SetBody(param).SetQueryParam("client_id", d.ClientID)
 	}, &resp)
 
@@ -496,7 +506,7 @@ func (d *PikPak) refreshCaptchaToken(action string, metas map[string]string) err
 	return nil
 }
 
-func (d *PikPak) UploadByOSS(params *S3Params, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *PikPak) UploadByOSS(ctx context.Context, params *S3Params, s model.FileStreamer, up driver.UpdateProgress) error {
 	ossClient, err := oss.New(params.Endpoint, params.AccessKeyID, params.AccessKeySecret)
 	if err != nil {
 		return err
@@ -506,14 +516,17 @@ func (d *PikPak) UploadByOSS(params *S3Params, stream model.FileStreamer, up dri
 		return err
 	}
 
-	err = bucket.PutObject(params.Key, stream, OssOption(params)...)
+	err = bucket.PutObject(params.Key, driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{
+		Reader:         s,
+		UpdateProgress: up,
+	}), OssOption(params)...)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *PikPak) UploadByMultipart(ctx context.Context, params *S3Params, fileSize int64, s model.FileStreamer, up driver.UpdateProgress) error {
 	var (
 		chunks    []oss.FileChunk
 		parts     []oss.UploadPart
@@ -523,7 +536,7 @@ func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream mode
 		err       error
 	)
 
-	tmpF, err := stream.CacheFullInTempFile()
+	tmpF, err := s.CacheFullInTempFile()
 	if err != nil {
 		return err
 	}
@@ -567,6 +580,7 @@ func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream mode
 		quit <- struct{}{}
 	}()
 
+	completedNum := atomic.Int32{}
 	// consumers
 	for i := 0; i < ThreadsNum; i++ {
 		go func(threadId int) {
@@ -579,6 +593,8 @@ func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream mode
 				var part oss.UploadPart // 出现错误就继续尝试，共尝试3次
 				for retry := 0; retry < 3; retry++ {
 					select {
+					case <-ctx.Done():
+						break
 					case <-ticker.C:
 						errCh <- errors.Wrap(err, "ossToken 过期")
 					default:
@@ -589,13 +605,16 @@ func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream mode
 						continue
 					}
 
-					b := bytes.NewBuffer(buf)
+					b := driver.NewLimitedUploadStream(ctx, bytes.NewReader(buf))
 					if part, err = bucket.UploadPart(imur, b, chunk.Size, chunk.Number, OssOption(params)...); err == nil {
 						break
 					}
 				}
 				if err != nil {
-					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", stream.GetName(), chunk.Number, err))
+					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", s.GetName(), chunk.Number, err))
+				} else {
+					num := completedNum.Add(1)
+					up(float64(num) * 100.0 / float64(len(chunks)))
 				}
 				UploadedPartsCh <- part
 			}
@@ -626,7 +645,7 @@ LOOP:
 	// EOF错误是xml的Unmarshal导致的，响应其实是json格式，所以实际上上传是成功的
 	if _, err = bucket.CompleteMultipartUpload(imur, parts, OssOption(params)...); err != nil && !errors.Is(err, io.EOF) {
 		// 当文件名含有 &< 这两个字符之一时响应的xml解析会出现错误，实际上上传是成功的
-		if filename := filepath.Base(stream.GetName()); !strings.ContainsAny(filename, "&<") {
+		if filename := filepath.Base(s.GetName()); !strings.ContainsAny(filename, "&<") {
 			return err
 		}
 	}
@@ -728,47 +747,4 @@ func OssOption(params *S3Params) []oss.Option {
 		oss.UserAgentHeader(OSSUserAgent),
 	}
 	return options
-}
-
-type AddressLatency struct {
-	Address string
-	Latency time.Duration
-}
-
-func checkLatency(address string, wg *sync.WaitGroup, ch chan<- AddressLatency) {
-	defer wg.Done()
-	start := time.Now()
-	resp, err := http.Get("https://" + address + "/generate_204")
-	if err != nil {
-		ch <- AddressLatency{Address: address, Latency: time.Hour} // Set high latency on error
-		return
-	}
-	defer resp.Body.Close()
-	latency := time.Since(start)
-	ch <- AddressLatency{Address: address, Latency: latency}
-}
-
-func findLowestLatencyAddress(addresses []string) string {
-	var wg sync.WaitGroup
-	ch := make(chan AddressLatency, len(addresses))
-
-	for _, address := range addresses {
-		wg.Add(1)
-		go checkLatency(address, &wg, ch)
-	}
-
-	wg.Wait()
-	close(ch)
-
-	var lowestLatencyAddress string
-	lowestLatency := time.Hour
-
-	for result := range ch {
-		if result.Latency < lowestLatency {
-			lowestLatency = result.Latency
-			lowestLatencyAddress = result.Address
-		}
-	}
-
-	return lowestLatencyAddress
 }

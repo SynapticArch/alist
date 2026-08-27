@@ -1,11 +1,13 @@
 appName="alist"
 builtAt="$(date +'%F %T %z')"
-goVersion=$(go version | sed 's/go version //')
 gitAuthor="Xhofe <i@nn.ci>"
 gitCommit=$(git log --pretty=format:"%h" -1)
 
 if [ "$1" = "dev" ]; then
   version="dev"
+  webVersion="dev"
+elif [ "$1" = "beta" ]; then
+  version="beta"
   webVersion="dev"
 else
   git tag -d beta
@@ -19,7 +21,6 @@ echo "frontend version: $webVersion"
 ldflags="\
 -w -s \
 -X 'github.com/alist-org/alist/v3/internal/conf.BuiltAt=$builtAt' \
--X 'github.com/alist-org/alist/v3/internal/conf.GoVersion=$goVersion' \
 -X 'github.com/alist-org/alist/v3/internal/conf.GitAuthor=$gitAuthor' \
 -X 'github.com/alist-org/alist/v3/internal/conf.GitCommit=$gitCommit' \
 -X 'github.com/alist-org/alist/v3/internal/conf.Version=$version' \
@@ -92,7 +93,7 @@ BuildDocker() {
 
 PrepareBuildDockerMusl() {
   mkdir -p build/musl-libs
-  BASE="https://musl.cc/"
+  BASE="https://github.com/go-cross/musl-toolchain-archive/releases/latest/download/"
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross i486-linux-musl-cross s390x-linux-musl-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross riscv64-linux-musl-cross powerpc64le-linux-musl-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
@@ -244,7 +245,7 @@ BuildReleaseFreeBSD() {
     cgo_cc="clang --target=${CGO_ARGS[$i]} --sysroot=/opt/freebsd/${os_arch}"
     echo building for freebsd-${os_arch}
     sudo mkdir -p "/opt/freebsd/${os_arch}"
-    wget -q https://download.freebsd.org/releases/${os_arch}/14.1-RELEASE/base.txz
+    wget -q https://download.freebsd.org/releases/${os_arch}/14.3-RELEASE/base.txz
     sudo tar -xf ./base.txz -C /opt/freebsd/${os_arch}
     rm base.txz
     export GOOS=freebsd
@@ -301,8 +302,12 @@ if [ "$1" = "dev" ]; then
   else
     BuildDev
   fi
-elif [ "$1" = "release" ]; then
-  FetchWebRelease
+elif [ "$1" = "release" -o "$1" = "beta" ]; then
+  if [ "$1" = "beta" ]; then
+    FetchWebDev
+  else
+    FetchWebRelease
+  fi
   if [ "$2" = "docker" ]; then
     BuildDocker
   elif [ "$2" = "docker-multiplatform" ]; then

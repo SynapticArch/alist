@@ -23,9 +23,9 @@ import (
 // do others that not defined in Driver interface
 
 const (
-	Api              = "https://www.123pan.com/api"
-	AApi             = "https://www.123pan.com/a/api"
-	BApi             = "https://www.123pan.com/b/api"
+	Api              = "https://yun.123pan.com/api"
+	AApi             = "https://yun.123pan.com/a/api"
+	BApi             = "https://yun.123pan.com/b/api"
 	LoginApi         = "https://login.123pan.com/api"
 	MainApi          = BApi
 	SignIn           = LoginApi + "/user/sign_in"
@@ -43,6 +43,7 @@ const (
 	S3Auth           = MainApi + "/file/s3_upload_object/auth"
 	UploadCompleteV2 = MainApi + "/file/upload_complete/v2"
 	S3Complete       = MainApi + "/file/s3_complete_multipart_upload"
+	SafeBoxUnlock    = MainApi + "/restful/goapi/v1/file/safe_box/auth/unlockbox"
 	//AuthKeySalt      = "8-8D$sL8gPjom7bk#cY"
 )
 
@@ -161,12 +162,12 @@ func (d *Pan123) login() error {
 	}
 	res, err := base.RestyClient.R().
 		SetHeaders(map[string]string{
-			"origin":      "https://www.123pan.com",
-			"referer":     "https://www.123pan.com/",
-			"user-agent":  "Dart/2.19(dart:io)-alist",
+			"origin":  "https://yun.123pan.com",
+			"referer": "https://yun.123pan.com/",
+			//"user-agent":  "Dart/2.19(dart:io)-alist",
 			"platform":    "web",
 			"app-version": "3",
-			//"user-agent":  base.UserAgent,
+			"user-agent":  base.UserAgent,
 		}).
 		SetBody(body).Post(SignIn)
 	if err != nil {
@@ -194,13 +195,15 @@ func (d *Pan123) login() error {
 //	return &authKey, nil
 //}
 
-func (d *Pan123) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+func (d *Pan123) Request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	isRetry := false
+do:
 	req := base.RestyClient.R()
 	req.SetHeaders(map[string]string{
-		"origin":        "https://www.123pan.com",
-		"referer":       "https://www.123pan.com/",
+		"origin":        "https://yun.123pan.com",
+		"referer":       "https://yun.123pan.com/",
 		"authorization": "Bearer " + d.AccessToken,
-		"user-agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) alist-client",
+		"user-agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
 		"platform":      "web",
 		"app-version":   "3",
 		//"user-agent":    base.UserAgent,
@@ -223,16 +226,33 @@ func (d *Pan123) request(url string, method string, callback base.ReqCallback, r
 	body := res.Body()
 	code := utils.Json.Get(body, "code").ToInt()
 	if code != 0 {
-		if code == 401 {
+		if !isRetry && code == 401 {
 			err := d.login()
 			if err != nil {
 				return nil, err
 			}
-			return d.request(url, method, callback, resp)
+			isRetry = true
+			goto do
 		}
 		return nil, errors.New(jsoniter.Get(body, "message").ToString())
 	}
 	return body, nil
+}
+
+func (d *Pan123) unlockSafeBox(fileId int64) error {
+	if _, ok := d.safeBoxUnlocked.Load(fileId); ok {
+		return nil
+	}
+	data := base.Json{"password": d.SafePassword}
+	url := fmt.Sprintf("%s?fileId=%d", SafeBoxUnlock, fileId)
+	_, err := d.Request(url, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data)
+	}, nil)
+	if err != nil {
+		return err
+	}
+	d.safeBoxUnlocked.Store(fileId, true)
+	return nil
 }
 
 func (d *Pan123) getFiles(ctx context.Context, parentId string, name string) ([]File, error) {
@@ -260,10 +280,19 @@ func (d *Pan123) getFiles(ctx context.Context, parentId string, name string) ([]
 			"operateType":          "4",
 			"inDirectSpace":        "false",
 		}
-		_res, err := d.request(FileList, http.MethodGet, func(req *resty.Request) {
+		_res, err := d.Request(FileList, http.MethodGet, func(req *resty.Request) {
 			req.SetQueryParams(query)
 		}, &resp)
 		if err != nil {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "safe box") || strings.Contains(err.Error(), "保险箱") {
+				if fid, e := strconv.ParseInt(parentId, 10, 64); e == nil {
+					if e = d.unlockSafeBox(fid); e == nil {
+						return d.getFiles(ctx, parentId, name)
+					}
+					return nil, e
+				}
+			}
 			return nil, err
 		}
 		log.Debug(string(_res))

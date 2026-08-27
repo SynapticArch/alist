@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"golang.org/x/time/rate"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
+
+	_123 "github.com/alist-org/alist/v3/drivers/123"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
@@ -23,6 +25,7 @@ type Pan123Share struct {
 	model.Storage
 	Addition
 	apiRateLimit sync.Map
+	ref          *_123.Pan123
 }
 
 func (d *Pan123Share) Config() driver.Config {
@@ -39,7 +42,17 @@ func (d *Pan123Share) Init(ctx context.Context) error {
 	return nil
 }
 
+func (d *Pan123Share) InitReference(storage driver.Driver) error {
+	refStorage, ok := storage.(*_123.Pan123)
+	if ok {
+		d.ref = refStorage
+		return nil
+	}
+	return fmt.Errorf("ref: storage is not 123Pan")
+}
+
 func (d *Pan123Share) Drop(ctx context.Context) error {
+	d.ref = nil
 	return nil
 }
 
@@ -94,7 +107,7 @@ func (d *Pan123Share) Link(ctx context.Context, file model.Obj, args model.LinkA
 		}
 		u_ := u.String()
 		log.Debug("download url: ", u_)
-		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://www.123pan.com/").Get(u_)
+		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://yun.123pan.com/").Get(u_)
 		if err != nil {
 			return nil, err
 		}
@@ -109,7 +122,7 @@ func (d *Pan123Share) Link(ctx context.Context, file model.Obj, args model.LinkA
 			link.URL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
 		}
 		link.Header = http.Header{
-			"Referer": []string{"https://www.123pan.com/"},
+			"Referer": []string{"https://yun.123pan.com/"},
 		}
 		return &link, nil
 	}
